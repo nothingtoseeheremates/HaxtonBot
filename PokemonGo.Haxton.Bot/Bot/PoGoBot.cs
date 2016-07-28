@@ -34,6 +34,7 @@ namespace PokemonGo.Haxton.Bot.Bot
         private readonly IPoGoNavigation _navigation;
         private readonly IPoGoInventory _inventory;
         private readonly IPoGoEncounter _encounter;
+        private readonly IPoGoSnipe _snipe;
         private readonly IPoGoFort _fort;
         private readonly IPoGoMap _map;
         private readonly ILogicSettings _settings;
@@ -42,11 +43,12 @@ namespace PokemonGo.Haxton.Bot.Bot
         public bool ShouldEvolvePokemon { get; set; }
         public bool ShouldTransferPokemon { get; set; }
 
-        public PoGoBot(IPoGoNavigation navigation, IPoGoInventory inventory, IPoGoEncounter encounter, IPoGoFort fort, IPoGoMap map, ILogicSettings settings)
+        public PoGoBot(IPoGoNavigation navigation, IPoGoInventory inventory, IPoGoEncounter encounter, IPoGoSnipe snipe, IPoGoFort fort, IPoGoMap map, ILogicSettings settings)
         {
             _navigation = navigation;
             _inventory = inventory;
             _encounter = encounter;
+            _snipe = snipe;
             _fort = fort;
             _map = map;
             _settings = settings;
@@ -82,7 +84,18 @@ namespace PokemonGo.Haxton.Bot.Bot
             var returnToStart = DateTime.Now;
             while (true)
             {
-                if (returnToStart.AddMinutes(2) <= DateTime.Now)
+                var isSniping = false;
+                var loc = new KeyValuePair<double, double>();
+                if (_snipe.SnipeLocations.Count > 0)
+                {
+                    if (_snipe.SnipeLocations.TryTake(out loc))
+                    {
+                        logger.Info($"Sniping pokemon at {loc.Key}, {loc.Value}");
+                        await _navigation.TeleportToLocation(loc.Key, loc.Value);
+                        isSniping = true;
+                    }
+                }
+                else if (returnToStart.AddMinutes(2) <= DateTime.Now)
                 {
                     await _navigation.TeleportToPokestop(firstPokestop);
                     returnToStart = DateTime.Now;
@@ -91,6 +104,7 @@ namespace PokemonGo.Haxton.Bot.Bot
                     (await _map.GetPokeStops()).Where(
                         t => t.CooldownCompleteTimestampMs < DateTime.UtcNow.ToUnixTime())
                         .ToList();
+
                 if (!pokestopList.Any())
                 {
                     await _navigation.TeleportToPokestop(firstPokestop);
@@ -134,7 +148,7 @@ namespace PokemonGo.Haxton.Bot.Bot
                             _settings.WalkingSpeedInKilometerPerHour,
                             async () =>
                             {
-                                await CatchNearbyPokemon(closestPokestop);
+                                await CatchNearbyPokemon(closestPokestop, isSniping);
                             });
                 }
 
@@ -159,14 +173,20 @@ namespace PokemonGo.Haxton.Bot.Bot
                                     closestPokestop.Longitude);
                     }
                 }
-                await CatchNearbyPokemon(closestPokestop);
+
+                if (isSniping)
+                {
+                    //await Task.Delay(5000);
+                    await _navigation.TeleportToLocation(loc.Key, loc.Value);
+                }
+                await CatchNearbyPokemon(closestPokestop, isSniping);
 
                 await Task.Delay(100);
                 //}
             }
         }
 
-        private async Task CatchNearbyPokemon(FortData fortData)
+        private async Task CatchNearbyPokemon(FortData fortData, bool isSniping)
         {
             var pokemon = _map.GetNearbyPokemonClosestFirst().GetAwaiter().GetResult().DistinctBy(i => i.SpawnPointId).ToList();
             if (pokemon.Any())
@@ -180,14 +200,15 @@ namespace PokemonGo.Haxton.Bot.Bot
                 var encounter = await _encounter.EncounterPokemonLure(encounterId, fortData.Id);
                 if (encounter.Result == DiskEncounterResponse.Types.Result.Success)
                 {
+                    if (isSniping)
+                        await _navigation.TeleportToPokestop(fortData);
                     await _encounter.CatchPokemon(encounterId, fortData.Id, encounter, encounter.PokemonData.PokemonId);
                 }
             }
+            var taskList = new List<Task>();
             foreach (var mapPokemon in pokemon)
             {
-                //logger.Info($"Found {pokemon.Count()} pokemon in your area.");
-                if (_settings.UsePokemonToNotCatchFilter &&
-                    _settings.PokemonsNotToCatch.Contains(mapPokemon.PokemonId))
+                if (_settings.UsePokemonToNotCatchFilter && _settings.PokemonsNotToCatch.Contains(mapPokemon.PokemonId))
                 {
                     continue;
                 }
@@ -195,7 +216,10 @@ namespace PokemonGo.Haxton.Bot.Bot
                 var encounter = await _encounter.EncounterPokemonAsync(mapPokemon);
                 if (encounter.Status == EncounterResponse.Types.Status.EncounterSuccess)
                 {
-                    await _encounter.CatchPokemon(encounter, mapPokemon);
+                    taskList.Add(new Task(async () =>
+                    {
+                        await _encounter.CatchPokemon(encounter, mapPokemon);
+                    }));
                 }
                 else
                 {
@@ -203,6 +227,11 @@ namespace PokemonGo.Haxton.Bot.Bot
                         logger.Warn($"Unable to catch pokemon. Reason: {encounter.Status}");
                 }
             }
+            if (isSniping)
+                await _navigation.TeleportToPokestop(fortData);
+            var arrayTasks = taskList.ToArray();
+            arrayTasks.ForEach(x => x.Start());
+            Task.WaitAll(arrayTasks);
         }
 
         private async Task TransferDuplicatePokemon()
